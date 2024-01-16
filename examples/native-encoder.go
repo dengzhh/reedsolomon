@@ -1,49 +1,29 @@
-//go:build ignore
-// +build ignore
-
-// Copyright 2015, Klaus Post, see LICENSE for details.
-//
-// Simple encoder example
-//
-// The encoder encodes a simgle file into a number of shards
-// To reverse the process see "simpledecoder.go"
-//
-// To build an executable use:
-//
-// go build simple-decoder.go
-//
-// Simple Encoder/Decoder Shortcomings:
-// * If the file size of the input isn't divisible by the number of data shards
-//   the output will contain extra zeroes
-//
-// * If the shard numbers isn't the same for the decoder as in the
-//   encoder, invalid output will be generated.
-//
-// * If values have changed in a shard, it cannot be reconstructed.
-//
-// * If two shards have been swapped, reconstruction will always fail.
-//   You need to supply the shards in the same order as they were given to you.
-//
-// The solution for this is to save a metadata file containing:
-//
-// * File size.
-// * The number of data/parity shards.
-// * HASH of each shard.
-// * Order of the shards.
-//
-// If you save these properties, you should abe able to detect file corruption
-// in a shard and be able to reconstruct your data if you have the needed number of shards left.
-
 package main
 
+import "C"
 import (
 	"flag"
 	"fmt"
-	"github.com/klauspost/reedsolomon"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"unsafe"
 )
+
+// #cgo CFLAGS: -I./
+// #cgo LDFLAGS: -L./ -lerasurecode
+// #include "erasure_coder.h"
+// void load_erasurecode_lib(char* err, size_t err_len);
+//
+// typedef struct {
+//     unsigned char *data[14];
+// } EcShard;
+//
+// // Fix panic: runtime error: cgo argument has Go pointer to Go pointer
+// void setPointer(unsigned char **pp, int index, unsigned char *p) {
+//     pp[index] = p;
+// }
+import "C"
 
 var dataShards = flag.Int("data", 4, "Number of shards to split the data into, must be below 257.")
 var parShards = flag.Int("par", 2, "Number of parity shards")
@@ -120,20 +100,32 @@ func main() {
 		padding = padding[1:]
 	}
 
-	// Create encoding matrix.
-	enc, err := reedsolomon.New(*dataShards, *parShards, reedsolomon.WithAutoGoroutines(actualShardSize), reedsolomon.WithCauchyMatrix())
-	// Not compatible with ozone EC. enc, err := reedsolomon.New(*dataShards, *parShards, reedsolomon.WithAutoGoroutines(actualShardSize))
-	checkErr(err)
-
-	// Encode parity
-	err = enc.Encode(shards2)
-	checkErr(err)
-
 	// Write out the resulting files.
 	dir, file := filepath.Split(fname)
 	if *outDir != "" {
 		dir = *outDir
 	}
+
+	// Use native erasure coding
+	isalEncoder := C.IsalEncoder{}
+	//size := (C.size_t)(C.sizeof_IsalEncoder)
+	//pEncoder := (*C.IsalEncoder)(C.malloc(size))
+	cErr := [256]byte{}
+	C.load_erasurecode_lib((*C.char)(unsafe.Pointer(&cErr[0])), 256)
+	C.initEncoder(&isalEncoder, (C.int)(*dataShards), (C.int)(*parShards))
+	inputs := (**C.uchar)(C.malloc(C.size_t(*dataShards) * 8))
+	for i = 0; i < *dataShards; i++ {
+		C.setPointer(inputs, C.int(i), (*C.uchar)(unsafe.Pointer(&shards2[i][0])))
+	}
+	outputs := (**C.uchar)(C.malloc(C.size_t(*parShards) * 8))
+	for i = 0; i < *parShards; i++ {
+		C.setPointer(outputs, C.int(i), (*C.uchar)(unsafe.Pointer(&shards2[*dataShards+i][0])))
+	}
+	C.encode(&isalEncoder, inputs, outputs, C.int(actualShardSize))
+	C.free(unsafe.Pointer(inputs))
+	C.free(unsafe.Pointer(outputs))
+
+	dir = *outDir + "-native"
 	for i, shard := range shards2 {
 		outfn := fmt.Sprintf("%s.%d", file, i)
 
